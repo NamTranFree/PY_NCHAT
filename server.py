@@ -50,6 +50,7 @@ logger = logging.getLogger("chat-server")
 
 
 def required_env(name: str, default: str | None = None) -> str:
+    """Đọc biến môi trường bắt buộc hoặc trả về giá trị mặc định."""
     value = os.getenv(name, default)
     if value is None or value == "":
         raise RuntimeError(f"Thiếu cấu hình môi trường {name}.")
@@ -70,6 +71,7 @@ if not DATABASE_NAME_RE.fullmatch(DB_NAME):
 
 
 def db_connection() -> pymysql.connections.Connection:
+    """Mở kết nối MySQL theo cấu hình môi trường của server."""
     return pymysql.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -84,6 +86,8 @@ def db_connection() -> pymysql.connections.Connection:
 
 
 def initialize_database() -> None:
+    """Tạo database/bảng còn thiếu và áp dụng các bổ sung schema an toàn."""
+    # Khởi tạo schema trước khi mở cổng để request luôn có CSDL sẵn sàng.
     schema_path = Path(__file__).with_name("schema.sql")
     sql = schema_path.read_text(encoding="utf-8")
     statements = [part.strip() for part in sql.split(";") if part.strip()]
@@ -109,11 +113,13 @@ def initialize_database() -> None:
                 cursor.execute(statement)
             ensure_profile_visibility_columns(cursor)
             ensure_group_message_type_column(cursor)
+            ensure_group_leader_column(cursor)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     logger.info("Đã kiểm tra cơ sở dữ liệu %s.", DB_NAME)
 
 
 def ensure_profile_visibility_columns(cursor: Any) -> None:
+    """Bổ sung các cột quyền riêng tư cho bảng users nếu database cũ thiếu."""
     cursor.execute("SHOW COLUMNS FROM users")
     existing_columns = {row["Field"] for row in cursor.fetchall()}
     for column in PROFILE_VISIBILITY_COLUMNS:
@@ -127,6 +133,7 @@ def ensure_profile_visibility_columns(cursor: Any) -> None:
 
 
 def ensure_group_message_type_column(cursor: Any) -> None:
+    """Thêm loại tin nhắn hệ thống cho bảng lịch sử nhóm cũ nếu cần."""
     cursor.execute("SHOW COLUMNS FROM group_messages")
     existing_columns = {row["Field"] for row in cursor.fetchall()}
     if "message_type" not in existing_columns:
@@ -137,19 +144,56 @@ def ensure_group_message_type_column(cursor: Any) -> None:
         logger.info("Đã thêm cột loại tin nhắn vào bảng group_messages.")
 
 
+def ensure_group_leader_column(cursor: Any) -> None:
+    """Thêm trưởng nhóm riêng và giữ nguyên người đã tạo nhóm."""
+    cursor.execute("SHOW COLUMNS FROM chat_groups")
+    columns = {row["Field"]: row for row in cursor.fetchall()}
+    if "leader_id" not in columns:
+        cursor.execute(
+            "ALTER TABLE chat_groups ADD COLUMN leader_id BIGINT UNSIGNED NULL"
+        )
+        needs_not_null = True
+    else:
+        needs_not_null = columns["leader_id"].get("Null") == "YES"
+    cursor.execute(
+        "UPDATE chat_groups SET leader_id = created_by WHERE leader_id IS NULL"
+    )
+    if needs_not_null:
+        cursor.execute(
+            "ALTER TABLE chat_groups MODIFY leader_id BIGINT UNSIGNED NOT NULL"
+        )
+    cursor.execute(
+        "SELECT CONSTRAINT_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS "
+        "WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = 'chat_groups' "
+        "AND CONSTRAINT_NAME = %s",
+        ("fk_chat_groups_leader",),
+    )
+    if cursor.fetchone() is None:
+        cursor.execute(
+            "ALTER TABLE chat_groups ADD CONSTRAINT fk_chat_groups_leader "
+            "FOREIGN KEY (leader_id) REFERENCES users(id)"
+        )
+    if "leader_id" not in columns:
+        logger.info("Đã thêm cột trưởng nhóm vào bảng chat_groups.")
+
+
 def send_json(sock: socket.socket, lock: threading.Lock, payload: dict[str, Any]) -> None:
+    """Mã hóa payload thành một dòng JSON và gửi an toàn qua socket."""
+    # Mỗi JSON là một dòng; lock ngăn các luồng ghi xen kẽ lên cùng socket.
     data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     with lock:
         sock.sendall(data + b"\n")
 
 
 def clean_filename(filename: str) -> str:
+    """Loại bỏ đường dẫn và ký tự không hợp lệ khỏi tên tệp tải lên."""
     name = Path(filename.replace("\\", "/")).name
     name = "".join(char for char in name if char.isprintable() and char not in '<>:"/\\|?*')
     return name[:255] or "tep_tin"
 
 
 def verify_password(stored_hash: str, password: str) -> bool:
+    """Kiểm tra mật khẩu với hash PBKDF2 lưu trong database."""
     try:
         algorithm, rounds, salt_hex, digest_hex = stored_hash.split("$", 3)
         if algorithm != "pbkdf2_sha256":
@@ -174,15 +218,18 @@ class ClientConnection:
     user_id: int | None = None
 
     def send(self, payload: dict[str, Any]) -> None:
+        """Gửi một payload tới client bằng khóa riêng của kết nối."""
         send_json(self.sock, self.send_lock, payload)
 
 
 class ChatServer:
     def __init__(self) -> None:
+        """Tạo trạng thái quản lý các tài khoản đang trực tuyến."""
         self.clients_lock = threading.Lock()
         self.online: dict[int, ClientConnection] = {}
 
     def broadcast_presence(self) -> None:
+        """Thông báo cho client đang kết nối rằng danh sách online đã đổi."""
         with self.clients_lock:
             clients = list(self.online.values())
         for client in clients:
@@ -192,10 +239,12 @@ class ChatServer:
                 logger.warning("Không thể thông báo trạng thái tới %s.", client.address)
 
     def handle_client(self, client: ClientConnection) -> None:
+        """Đọc request liên tục, gọi chức năng tương ứng và dọn kết nối."""
         logger.info("Kết nối từ %s.", client.address)
         try:
             reader = client.sock.makefile("rb")
             while True:
+                # TCP là luồng byte, vì vậy giao thức dùng newline để tách từng request.
                 raw = reader.readline(MAX_LINE_BYTES + 1)
                 if not raw:
                     break
@@ -273,6 +322,8 @@ class ChatServer:
     def dispatch(
         self, client: ClientConnection, action: str, data: dict[str, Any]
     ) -> dict[str, Any]:
+        """Kiểm tra xác thực và chuyển request tới trình xử lý chức năng."""
+        # Chỉ đăng ký/đăng nhập được phép trước xác thực; các action còn lại cần user_id.
         if action == "register":
             return self.register(data)
         if action == "login":
@@ -295,6 +346,10 @@ class ChatServer:
             return self.create_group(client.user_id, data)
         if action == "group_members":
             return self.group_members(client.user_id, data)
+        if action == "remove_group_member":
+            return self.remove_group_member(client.user_id, data)
+        if action == "transfer_group_leadership":
+            return self.transfer_group_leadership(client.user_id, data)
         if action == "rename_group":
             return self.rename_group(client.user_id, data)
         if action == "add_group_members":
@@ -312,6 +367,7 @@ class ChatServer:
         raise ValueError("Chức năng không được hỗ trợ.")
 
     def register(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Kiểm tra dữ liệu, băm mật khẩu và tạo tài khoản mới."""
         username = str(data.get("username", "")).strip()
         password = str(data.get("password", ""))
         display_name = str(data.get("display_name", "")).strip()
@@ -324,6 +380,7 @@ class ChatServer:
         if hmac.compare_digest(display_name, password):
             raise ValueError("Tên hiển thị không được trùng với mật khẩu.")
         salt = secrets.token_bytes(16)
+        # Lưu hash có salt thay vì mật khẩu gốc; salt ngẫu nhiên làm hash mỗi tài khoản khác nhau.
         derived_key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 600_000)
         hashed = f"pbkdf2_sha256$600000${salt.hex()}${derived_key.hex()}"
         with db_connection() as connection:
@@ -340,6 +397,7 @@ class ChatServer:
         return {"message": "Đăng ký thành công. Bạn có thể đăng nhập."}
 
     def login(self, client: ClientConnection, data: dict[str, Any]) -> dict[str, Any]:
+        """Xác thực tài khoản, đánh dấu online và trả thông tin hiển thị."""
         if client.user_id is not None:
             raise ValueError("Kết nối này đã đăng nhập.")
         username = str(data.get("username", "")).strip()
@@ -379,6 +437,7 @@ class ChatServer:
         }
 
     def profile(self, user_id: int) -> dict[str, Any]:
+        """Đọc hồ sơ đầy đủ của chính tài khoản đã đăng nhập."""
         with db_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -396,6 +455,7 @@ class ChatServer:
         return user
 
     def public_profile(self, viewer_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """Chỉ trả về các trường hồ sơ mà chủ tài khoản cho phép công khai."""
         try:
             profile_user_id = int(data.get("user_id", 0))
         except (ValueError, TypeError) as error:
@@ -430,6 +490,7 @@ class ChatServer:
 
     @staticmethod
     def parse_visibility_flag(data: dict[str, Any], key: str) -> int:
+        """Chuẩn hóa giá trị quyền riêng tư thành cờ số 0 hoặc 1."""
         value = data.get(key, PROFILE_VISIBILITY_DEFAULTS[key])
         if isinstance(value, bool):
             return int(value)
@@ -438,6 +499,7 @@ class ChatServer:
         raise ValueError(f"Tùy chọn hiển thị {PROFILE_VISIBILITY_COLUMNS[key]} không hợp lệ.")
 
     def update_profile(self, user_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """Kiểm tra và lưu thông tin hồ sơ cùng tùy chọn quyền riêng tư."""
         display_name = str(data.get("display_name", "")).strip()
         interests = str(data.get("interests", "")).strip()
         hometown = str(data.get("hometown", "")).strip()
@@ -483,6 +545,7 @@ class ChatServer:
         return self.profile(user_id)
 
     def list_users(self, user_id: int) -> dict[str, Any]:
+        """Liệt kê tài khoản khác, trạng thái online và tên đã được ẩn phù hợp."""
         with db_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -502,23 +565,29 @@ class ChatServer:
         return {"users": users}
 
     def list_groups(self, user_id: int) -> dict[str, Any]:
+        """Liệt kê nhóm, số thành viên và ID trưởng nhóm hiện tại."""
         with db_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT g.id, g.name, COUNT(gm.user_id) AS member_count "
+                    "SELECT g.id, g.name, g.created_by AS creator_id, "
+                    "g.leader_id, "
+                    "COUNT(gm.user_id) AS member_count "
                     "FROM chat_groups g "
                     "JOIN group_members mine ON mine.group_id = g.id AND mine.user_id = %s "
                     "JOIN group_members gm ON gm.group_id = g.id "
-                    "GROUP BY g.id, g.name ORDER BY g.name",
+                    "GROUP BY g.id, g.name, g.created_by, g.leader_id ORDER BY g.name",
                     (user_id,),
                 )
                 groups = list(cursor.fetchall())
         for group in groups:
             group["id"] = int(group["id"])
+            group["creator_id"] = int(group["creator_id"])
+            group["leader_id"] = int(group["leader_id"])
             group["member_count"] = int(group["member_count"])
         return {"groups": groups}
 
     def create_group(self, user_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """Tạo nhóm, thêm người tạo/thành viên và báo nhóm mới cho thành viên."""
         name = str(data.get("name", "")).strip()
         if not name or len(name) > 80:
             raise ValueError("Tên nhóm không được để trống và tối đa 80 ký tự.")
@@ -548,8 +617,9 @@ class ChatServer:
                 connection.begin()
                 try:
                     cursor.execute(
-                        "INSERT INTO chat_groups (name, created_by) VALUES (%s, %s)",
-                        (name, user_id),
+                        "INSERT INTO chat_groups (name, created_by, leader_id) "
+                        "VALUES (%s, %s, %s)",
+                        (name, user_id, user_id),
                     )
                     group_id = int(cursor.lastrowid)
                     group_members = [(group_id, member_id) for member_id in [user_id, *member_ids]]
@@ -565,6 +635,8 @@ class ChatServer:
             "id": group_id,
             "name": name,
             "member_count": len(member_ids) + 1,
+            "creator_id": user_id,
+            "leader_id": user_id,
         }
         self.broadcast_group_event(
             [member_id for member_id in member_ids],
@@ -576,25 +648,41 @@ class ChatServer:
         }
 
     def group_members(self, user_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """Trả danh sách thành viên sau khi xác nhận người gọi thuộc nhóm."""
         group_id = self.parse_group_id(data)
         with db_connection() as connection:
             with connection.cursor() as cursor:
                 self.require_group_membership(cursor, group_id, user_id)
                 cursor.execute(
+                    "SELECT created_by, leader_id FROM chat_groups WHERE id = %s",
+                    (group_id,),
+                )
+                group = cursor.fetchone()
+                if group is None:
+                    raise ValueError("Không tìm thấy nhóm.")
+                cursor.execute(
                     "SELECT gm.user_id AS id, "
                     "CASE WHEN u.is_display_name_public = 1 THEN u.display_name "
                     "ELSE 'Người dùng' END AS display_name "
                     "FROM group_members gm JOIN users u ON u.id = gm.user_id "
-                    "WHERE gm.group_id = %s ORDER BY u.display_name",
+                    "JOIN chat_groups g ON g.id = gm.group_id "
+                    "WHERE gm.group_id = %s "
+                    "ORDER BY (gm.user_id = g.leader_id) DESC, "
+                    "(gm.user_id = g.created_by) DESC, u.display_name",
                     (group_id,),
                 )
                 members = list(cursor.fetchall())
         for member in members:
             member["id"] = int(member["id"])
-        return {"members": members}
+        return {
+            "members": members,
+            "creator_id": int(group["created_by"]),
+            "leader_id": int(group["leader_id"]),
+        }
 
     @staticmethod
     def public_user_names(cursor: Any, user_ids: list[int]) -> dict[int, str]:
+        """Lấy tên hiển thị công khai cho các thành viên theo ID."""
         placeholders = ", ".join(["%s"] * len(user_ids))
         cursor.execute(
             "SELECT id, CASE WHEN is_display_name_public = 1 THEN display_name "
@@ -611,6 +699,7 @@ class ChatServer:
     def record_group_activity(
         cursor: Any, group_id: int, actor_id: int, body: str
     ) -> dict[str, Any]:
+        """Lưu một thông báo hệ thống trong lịch sử nhóm và trả bản ghi đó."""
         cursor.execute(
             "INSERT INTO group_messages (group_id, sender_id, body, message_type) "
             "VALUES (%s, %s, %s, 'system')",
@@ -633,6 +722,7 @@ class ChatServer:
     def broadcast_group_event(
         self, user_ids: list[int], event_name: str, data: dict[str, Any]
     ) -> None:
+        """Phát một sự kiện nhóm tới các thành viên hiện đang online."""
         with self.clients_lock:
             recipients = [
                 self.online[user_id]
@@ -652,6 +742,7 @@ class ChatServer:
                 )
 
     def rename_group(self, user_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """Đổi tên nhóm, ghi người thực hiện vào lịch sử và thông báo thành viên."""
         group_id = self.parse_group_id(data)
         name = str(data.get("name", "")).strip()
         if not name or len(name) > 80:
@@ -691,6 +782,7 @@ class ChatServer:
     def add_group_members(
         self, user_id: int, data: dict[str, Any]
     ) -> dict[str, Any]:
+        """Thêm thành viên mới hợp lệ và lưu thông báo hoạt động trong nhóm."""
         group_id = self.parse_group_id(data)
         raw_member_ids = data.get("member_ids")
         if not isinstance(raw_member_ids, list) or not raw_member_ids:
@@ -761,24 +853,168 @@ class ChatServer:
         )
         return {"group": group, "message": message}
 
+    def remove_group_member(
+        self, user_id: int, data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Cho phép trưởng nhóm xóa thành viên và ghi lại hoạt động đó."""
+        group_id = self.parse_group_id(data)
+        try:
+            member_id = int(data.get("member_id", 0))
+        except (ValueError, TypeError) as error:
+            raise ValueError("Thành viên cần xóa không hợp lệ.") from error
+        if member_id < 1 or member_id == user_id:
+            raise ValueError("Không thể xóa thành viên này khỏi nhóm.")
+
+        with db_connection() as connection:
+            with connection.cursor() as cursor:
+                connection.begin()
+                try:
+                    cursor.execute(
+                        "SELECT created_by, leader_id, name FROM chat_groups "
+                        "WHERE id = %s FOR UPDATE",
+                        (group_id,),
+                    )
+                    group_row = cursor.fetchone()
+                    if group_row is None:
+                        raise ValueError("Không tìm thấy nhóm.")
+                    self.require_group_membership(cursor, group_id, user_id)
+                    if int(group_row["leader_id"]) != user_id:
+                        raise ValueError("Chỉ trưởng nhóm mới có thể xóa thành viên.")
+                    self.require_group_membership(cursor, group_id, member_id)
+                    names = self.public_user_names(cursor, [user_id, member_id])
+                    actor_name = names.get(user_id, "Trưởng nhóm")
+                    member_name = names.get(member_id, "Thành viên")
+                    message = self.record_group_activity(
+                        cursor,
+                        group_id,
+                        user_id,
+                        f"{actor_name} đã xóa {member_name} khỏi nhóm.",
+                    )
+                    cursor.execute(
+                        "DELETE FROM group_members WHERE group_id = %s AND user_id = %s",
+                        (group_id, member_id),
+                    )
+                    cursor.execute(
+                        "SELECT user_id FROM group_members WHERE group_id = %s",
+                        (group_id,),
+                    )
+                    remaining_ids = [
+                        int(row["user_id"]) for row in cursor.fetchall()
+                    ]
+                    connection.commit()
+                except (ValueError, pymysql.MySQLError):
+                    connection.rollback()
+                    raise
+
+        group = {
+            "id": group_id,
+            "name": group_row["name"],
+            "member_count": len(remaining_ids),
+            "creator_id": int(group_row["created_by"]),
+            "leader_id": user_id,
+        }
+        result = {
+            "group": group,
+            "message": message,
+            "removed_user_id": member_id,
+        }
+        self.broadcast_group_event(
+            [*remaining_ids, member_id], "group_updated", result
+        )
+        return result
+
+    def transfer_group_leadership(
+        self, user_id: int, data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Chuyển quyền trưởng nhóm cho một thành viên đang ở trong nhóm."""
+        group_id = self.parse_group_id(data)
+        try:
+            member_id = int(data.get("member_id", 0))
+        except (ValueError, TypeError) as error:
+            raise ValueError("Trưởng nhóm mới không hợp lệ.") from error
+        if member_id < 1 or member_id == user_id:
+            raise ValueError("Hãy chọn một thành viên khác làm trưởng nhóm.")
+
+        with db_connection() as connection:
+            with connection.cursor() as cursor:
+                connection.begin()
+                try:
+                    cursor.execute(
+                        "SELECT created_by, leader_id, name FROM chat_groups "
+                        "WHERE id = %s FOR UPDATE",
+                        (group_id,),
+                    )
+                    group_row = cursor.fetchone()
+                    if group_row is None:
+                        raise ValueError("Không tìm thấy nhóm.")
+                    self.require_group_membership(cursor, group_id, user_id)
+                    if int(group_row["leader_id"]) != user_id:
+                        raise ValueError("Chỉ trưởng nhóm mới có thể chuyển quyền.")
+                    self.require_group_membership(cursor, group_id, member_id)
+                    names = self.public_user_names(cursor, [user_id, member_id])
+                    actor_name = names.get(user_id, "Trưởng nhóm")
+                    member_name = names.get(member_id, "Thành viên")
+                    cursor.execute(
+                        "UPDATE chat_groups SET leader_id = %s WHERE id = %s",
+                        (member_id, group_id),
+                    )
+                    message = self.record_group_activity(
+                        cursor,
+                        group_id,
+                        user_id,
+                        f"{actor_name} đã chuyển quyền trưởng nhóm cho {member_name}.",
+                    )
+                    cursor.execute(
+                        "SELECT user_id FROM group_members WHERE group_id = %s",
+                        (group_id,),
+                    )
+                    member_ids = [int(row["user_id"]) for row in cursor.fetchall()]
+                    connection.commit()
+                except (ValueError, pymysql.MySQLError):
+                    connection.rollback()
+                    raise
+
+        group = {
+            "id": group_id,
+            "name": group_row["name"],
+            "member_count": len(member_ids),
+            "creator_id": int(group_row["created_by"]),
+            "leader_id": member_id,
+        }
+        result = {"group": group, "message": message}
+        self.broadcast_group_event(member_ids, "group_updated", result)
+        return result
+
     def leave_group(self, user_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """Xóa người gọi khỏi nhóm và báo thành viên còn lại trong lịch sử."""
         group_id = self.parse_group_id(data)
         with db_connection() as connection:
             with connection.cursor() as cursor:
-                self.require_group_membership(cursor, group_id, user_id)
-                cursor.execute(
-                    "SELECT user_id FROM group_members WHERE group_id = %s",
-                    (group_id,),
-                )
-                remaining_ids = [
-                    int(row["user_id"])
-                    for row in cursor.fetchall()
-                    if int(row["user_id"]) != user_id
-                ]
-                names = self.public_user_names(cursor, [user_id])
-                actor_name = names.get(user_id, "Một thành viên")
                 connection.begin()
                 try:
+                    cursor.execute(
+                        "SELECT leader_id FROM chat_groups WHERE id = %s FOR UPDATE",
+                        (group_id,),
+                    )
+                    group_owner = cursor.fetchone()
+                    if group_owner is None:
+                        raise ValueError("Không tìm thấy nhóm.")
+                    self.require_group_membership(cursor, group_id, user_id)
+                    if int(group_owner["leader_id"]) == user_id:
+                        raise ValueError(
+                            "Hãy chuyển quyền trưởng nhóm trước khi rời nhóm."
+                        )
+                    cursor.execute(
+                        "SELECT user_id FROM group_members WHERE group_id = %s",
+                        (group_id,),
+                    )
+                    remaining_ids = [
+                        int(row["user_id"])
+                        for row in cursor.fetchall()
+                        if int(row["user_id"]) != user_id
+                    ]
+                    names = self.public_user_names(cursor, [user_id])
+                    actor_name = names.get(user_id, "Một thành viên")
                     message = self.record_group_activity(
                         cursor, group_id, user_id, f"{actor_name} đã rời nhóm."
                     )
@@ -788,12 +1024,13 @@ class ChatServer:
                     )
                     if remaining_ids:
                         cursor.execute(
-                            "SELECT name FROM chat_groups WHERE id = %s",
+                            "SELECT name, created_by, leader_id "
+                            "FROM chat_groups WHERE id = %s",
                             (group_id,),
                         )
                         group_row = cursor.fetchone()
                     connection.commit()
-                except pymysql.MySQLError:
+                except (ValueError, pymysql.MySQLError):
                     connection.rollback()
                     raise
         if remaining_ids:
@@ -801,6 +1038,8 @@ class ChatServer:
                 "id": group_id,
                 "name": group_row["name"],
                 "member_count": len(remaining_ids),
+                "creator_id": int(group_row["created_by"]),
+                "leader_id": int(group_row["leader_id"]),
             }
             self.broadcast_group_event(
                 remaining_ids,
@@ -811,6 +1050,7 @@ class ChatServer:
 
     @staticmethod
     def require_group_membership(cursor: Any, group_id: int, user_id: int) -> None:
+        """Từ chối thao tác nếu tài khoản không thuộc nhóm được yêu cầu."""
         cursor.execute(
             "SELECT 1 FROM group_members WHERE group_id = %s AND user_id = %s",
             (group_id, user_id),
@@ -820,6 +1060,7 @@ class ChatServer:
 
     @staticmethod
     def parse_group_id(data: dict[str, Any]) -> int:
+        """Đọc và xác thực ID nhóm từ dữ liệu request."""
         try:
             group_id = int(data.get("group_id", 0))
         except (ValueError, TypeError) as error:
@@ -829,6 +1070,7 @@ class ChatServer:
         return group_id
 
     def group_history(self, user_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """Trả tối đa 100 tin nhắn nhóm sau khi xác thực membership."""
         group_id = self.parse_group_id(data)
         with db_connection() as connection:
             with connection.cursor() as cursor:
@@ -853,6 +1095,7 @@ class ChatServer:
         return {"messages": messages}
 
     def history(self, user_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """Trả tối đa 100 tin nhắn giữa hai tài khoản theo thứ tự thời gian."""
         try:
             other_id = int(data.get("user_id", 0))
         except (ValueError, TypeError) as error:
@@ -878,6 +1121,7 @@ class ChatServer:
         return {"messages": messages}
 
     def send_message(self, sender_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """Lưu tin cá nhân/tệp đính kèm và gửi sự kiện tới người nhận online."""
         try:
             recipient_id = int(data.get("recipient_id", 0))
         except (ValueError, TypeError) as error:
@@ -938,6 +1182,7 @@ class ChatServer:
                     (message_id,),
                 )
                 message = cursor.fetchone()
+        # Ghi lịch sử trước, sau đó mới gửi sự kiện thời gian thực cho người nhận đang online.
         message["id"] = int(message["id"])
         message["sender_id"] = int(message["sender_id"])
         message["recipient_id"] = int(message["recipient_id"])
@@ -953,6 +1198,7 @@ class ChatServer:
         return {"message": message}
 
     def send_group_message(self, sender_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """Lưu tin nhóm/tệp đính kèm và phát tới các thành viên online."""
         group_id = self.parse_group_id(data)
         body = str(data.get("body", ""))
         if len(body) > 5000:
@@ -1047,6 +1293,7 @@ class ChatServer:
         return {"message": message}
 
     def download(self, client: ClientConnection, data: dict[str, Any]) -> dict[str, Any]:
+        """Kiểm tra quyền truy cập rồi trả nội dung tệp dưới dạng Base64."""
         if client.user_id is None:
             raise ValueError("Vui lòng đăng nhập trước.")
         try:
@@ -1086,6 +1333,7 @@ class ChatServer:
         }
 
     def serve_forever(self) -> None:
+        """Khởi tạo database, mở cổng TCP và tạo luồng xử lý mỗi kết nối."""
         initialize_database()
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1095,6 +1343,7 @@ class ChatServer:
             while True:
                 sock, address = server_socket.accept()
                 client = ClientConnection(sock, address)
+                # Mỗi kết nối có luồng xử lý riêng để client này không chặn client khác.
                 threading.Thread(
                     target=self.handle_client,
                     args=(client,),

@@ -10,6 +10,7 @@ import queue
 import socket
 import tempfile
 import threading
+import unicodedata
 import uuid
 from pathlib import Path
 from tkinter import BooleanVar, Canvas, filedialog, font as tkfont, messagebox
@@ -37,6 +38,7 @@ WALLPAPER_DIRECTORY = Path(__file__).resolve().parent / "anh_nen"
 
 
 def parse_server_address(host: str, port_text: str) -> tuple[str, int]:
+    """Chuẩn hóa IP máy chủ và kiểm tra cổng trước khi kết nối."""
     host = host.strip()
     if not host:
         raise ValueError("Vui lòng nhập IP hoặc tên máy chủ.")
@@ -50,6 +52,7 @@ def parse_server_address(host: str, port_text: str) -> tuple[str, int]:
 
 
 def list_wallpapers(directory: Path) -> list[Path]:
+    """Liệt kê ảnh nền được hỗ trợ theo thứ tự tên ổn định."""
     supported_extensions = {".png", ".jpg", ".jpeg", ".webp"}
     if not directory.is_dir():
         return []
@@ -64,27 +67,75 @@ def list_wallpapers(directory: Path) -> list[Path]:
 
 
 def wallpaper_settings_path() -> Path:
+    """Trả về vị trí lưu tùy chọn cục bộ của người dùng."""
     local_app_data = os.getenv("LOCALAPPDATA")
     base_directory = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
     return base_directory / "NCHAT" / "chat_backgrounds.json"
 
 
 def nickname_settings_path() -> Path:
+    """Trả về tệp lưu biệt danh, tách biệt với cài đặt hình nền."""
     return wallpaper_settings_path().with_name("chat_nicknames.json")
 
 
 def conversation_key(user_id: int, other_id: int) -> str:
+    """Tạo khóa chung cho một cuộc trò chuyện dù thứ tự hai người thay đổi."""
     return ":".join(str(value) for value in sorted((user_id, other_id)))
 
 
 def conversation_display_name(
     user: dict[str, Any], owner_id: int, nicknames: dict[str, str]
 ) -> str:
+    """Chọn biệt danh riêng nếu có, nếu không dùng tên hiển thị công khai."""
     nickname = nicknames.get(conversation_key(owner_id, user["id"]))
     return nickname or str(user.get("display_name") or "Người dùng")
 
 
+def group_member_role_text(member_id: int, leader_id: int, creator_id: int) -> str:
+    """Mô tả riêng vai trò trưởng nhóm và người tạo nhóm."""
+    if member_id == leader_id:
+        return (
+            "Trưởng nhóm · Người tạo nhóm"
+            if member_id == creator_id
+            else "Trưởng nhóm"
+        )
+    if member_id == creator_id:
+        return "Thành viên · Người tạo nhóm"
+    return "Thành viên"
+
+
+def filter_items_by_name(
+    items: list[dict[str, Any]],
+    query: str,
+    get_name: Callable[[dict[str, Any]], str],
+) -> list[dict[str, Any]]:
+    """Lọc tên theo tiền tố trước, rồi đến phần khớp không dấu."""
+    normalized_query = normalize_search_text(query)
+    if not normalized_query:
+        return list(items)
+    prefix_matches = []
+    partial_matches = []
+    for item in items:
+        name = normalize_search_text(get_name(item))
+        if name.startswith(normalized_query):
+            prefix_matches.append(item)
+        elif normalized_query in name:
+            partial_matches.append(item)
+    return prefix_matches + partial_matches
+
+
+def normalize_search_text(value: str) -> str:
+    """Chuẩn hóa chữ hoa/thường và dấu tiếng Việt cho tìm kiếm."""
+    decomposed = unicodedata.normalize("NFD", value.casefold())
+    return "".join(
+        character
+        for character in decomposed
+        if unicodedata.category(character) != "Mn"
+    ).replace("đ", "d")
+
+
 def load_wallpaper_preferences(path: Path) -> dict[str, str]:
+    """Đọc tệp tùy chọn dạng JSON và từ chối dữ liệu sai cấu trúc."""
     if not path.exists():
         return {}
     with path.open("r", encoding="utf-8") as settings_file:
@@ -98,6 +149,7 @@ def load_wallpaper_preferences(path: Path) -> dict[str, str]:
 
 
 def save_wallpaper_preferences(path: Path, settings: dict[str, str]) -> None:
+    """Lưu JSON qua tệp tạm để tránh hỏng cài đặt khi ghi bị gián đoạn."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
     try:
@@ -115,6 +167,7 @@ def save_wallpaper_preferences(path: Path, settings: dict[str, str]) -> None:
 
 class ChatClient:
     def __init__(self, root: ctk.CTk) -> None:
+        """Khởi tạo trạng thái ứng dụng, giao diện xác thực và kết nối nền."""
         self.root = root
         self.root.title("NCHAT | Trò chuyện kết nối")
         self.root.geometry("1120x780")
@@ -147,6 +200,7 @@ class ChatClient:
         self.message_time_font = tkfont.Font(root=self.root, family="Segoe UI", size=9)
         self.message_link_font = tkfont.Font(root=self.root, family="Segoe UI", size=12, weight="bold")
         self.conversation_options_view: ctk.CTkFrame | None = None
+        self.group_members_content: ctk.CTkFrame | None = None
         self.nickname_labels: dict[int, ctk.CTkLabel] = {}
         self.wallpaper_settings_path = wallpaper_settings_path()
         self.wallpaper_settings_error = ""
@@ -173,9 +227,11 @@ class ChatClient:
         self.root.after(150, self.connect_to_server)
 
     def send_request(self, action: str, data: dict[str, Any], callback: Callback) -> None:
+        """Gửi yêu cầu JSON tới server và lưu callback theo mã tương quan."""
         if self.sock is None:
             self.set_status("Chưa kết nối máy chủ. Hãy kiểm tra IP và cổng.", error=True)
             return
+        # ID tương quan giúp ghép response bất đồng bộ với đúng callback của yêu cầu.
         request_id = uuid.uuid4().hex
         payload = json.dumps(
             {"id": request_id, "action": action, "data": data},
@@ -195,6 +251,7 @@ class ChatClient:
             self.set_status(f"Không gửi được yêu cầu: {error}", error=True)
 
     def connect_to_server(self) -> bool:
+        """Kết nối hoặc đổi kết nối theo IP/cổng nhập trên màn hình."""
         try:
             address = parse_server_address(
                 self.server_host_entry.get(), self.server_port_entry.get()
@@ -236,6 +293,8 @@ class ChatClient:
         return True
 
     def read_messages(self, sock: socket.socket) -> None:
+        """Đọc phản hồi và sự kiện từ socket ở luồng nền."""
+        # Socket được đọc ở luồng nền; queue chuyển dữ liệu về luồng Tkinter an toàn.
         try:
             reader = sock.makefile("rb")
             while not self.closed and self.sock is sock:
@@ -274,6 +333,8 @@ class ChatClient:
                 )
 
     def process_incoming(self) -> None:
+        """Xử lý queue mạng trong luồng giao diện và lên lịch lần đọc kế tiếp."""
+        # Chạy định kỳ trong event loop để callback/event có thể cập nhật widget.
         while True:
             try:
                 message = self.incoming.get_nowait()
@@ -291,6 +352,7 @@ class ChatClient:
             self.root.after(100, self.process_incoming)
 
     def handle_event(self, event: dict[str, Any]) -> None:
+        """Cập nhật giao diện theo sự kiện trực tiếp do server phát."""
         if event.get("event") == "presence_changed":
             self.refresh_users()
         elif event.get("event") == "new_message":
@@ -326,13 +388,27 @@ class ChatClient:
         elif event.get("event") == "group_updated":
             data = event.get("data", {})
             self.apply_group_update(data)
+            if self.user and data.get("removed_user_id") == self.user["id"]:
+                self.close_conversation_options(animate=False)
+                self.set_status("Trưởng nhóm đã xóa bạn khỏi nhóm.", error=True)
+            elif (
+                self.selected_group
+                and isinstance(data.get("group"), dict)
+                and data["group"].get("id") == self.selected_group["id"]
+                and self.conversation_options_view is not None
+                and self.group_members_content is not None
+                and self.group_members_content.winfo_exists()
+            ):
+                self.load_group_members_feature(self.group_members_content)
 
     def clear_root(self) -> None:
+        """Đóng popup phụ rồi xóa các widget của màn hình hiện tại."""
         self.hide_emoji_picker()
         for child in self.root.winfo_children():
             child.destroy()
 
     def on_root_click(self, event: Any) -> None:
+        """Đóng bảng emoji khi người dùng bấm ra ngoài bảng và nút mở."""
         if self.emoji_popup is None or not self.emoji_popup.winfo_exists():
             return
         widget = self.root.winfo_containing(event.x_root, event.y_root)
@@ -353,11 +429,13 @@ class ChatClient:
         self.hide_emoji_picker()
 
     def hide_emoji_picker(self) -> None:
+        """Đóng bảng chọn emoji và xóa tham chiếu tới cửa sổ popup."""
         if self.emoji_popup is not None and self.emoji_popup.winfo_exists():
             self.emoji_popup.destroy()
         self.emoji_popup = None
 
     def toggle_emoji_picker(self) -> None:
+        """Mở hoặc đóng bảng emoji cạnh ô soạn tin nhắn."""
         if self.emoji_popup is not None and self.emoji_popup.winfo_exists():
             self.hide_emoji_picker()
             return
@@ -401,6 +479,7 @@ class ChatClient:
         self.set_status("Chọn một biểu tượng cảm xúc.")
 
     def insert_emoji(self, emoji: str) -> None:
+        """Chèn emoji đã chọn vào ô soạn tin và trả tiêu điểm về ô nhập."""
         if not hasattr(self, "message_entry") or not self.message_entry.winfo_exists():
             return
         self.message_entry.insert("end", emoji)
@@ -408,12 +487,14 @@ class ChatClient:
         self.hide_emoji_picker()
 
     def set_status(self, text: str, error: bool = False) -> None:
+        """Hiển thị thông báo trạng thái tại màn hình đang mở."""
         if hasattr(self, "status_label") and self.status_label.winfo_exists():
             self.status_label.configure(text=text, text_color="#C44545" if error else MUTED)
         elif hasattr(self, "auth_status") and self.auth_status.winfo_exists():
             self.auth_status.configure(text=text, text_color="#C44545" if error else GREEN)
 
     def show_auth(self, mode: str = "login") -> None:
+        """Dựng màn hình đăng nhập/đăng ký kèm cấu hình máy chủ."""
         if hasattr(self, "server_host_entry") and self.server_host_entry.winfo_exists():
             self.server_host_value = self.server_host_entry.get().strip()
             self.server_port_value = self.server_port_entry.get().strip()
@@ -543,12 +624,14 @@ class ChatClient:
         self.root.bind("<Escape>", self.go_back)
 
     def go_back(self, _event: Any = None) -> None:
+        """Điều hướng phím Escape về đăng nhập hoặc trở lại màn hình chat."""
         if self.screen == "auth" and "display_name" in getattr(self, "auth_entries", {}):
             self.show_auth("login")
         elif self.screen in ("profile", "public_profile"):
             self.return_to_chat()
 
     def submit_auth(self, _event: Any = None) -> None:
+        """Gửi biểu mẫu đăng ký hoặc đăng nhập khi nhấn Enter."""
         if self.screen == "auth":
             if "display_name" in self.auth_entries:
                 self.register()
@@ -556,6 +639,7 @@ class ChatClient:
                 self.login()
 
     def login(self) -> None:
+        """Kiểm tra kết nối rồi gửi thông tin đăng nhập tới server."""
         self.set_status("")
         if not self.connect_to_server():
             return
@@ -569,6 +653,7 @@ class ChatClient:
         )
 
     def register(self) -> None:
+        """Kiểm tra kết nối rồi gửi thông tin đăng ký tới server."""
         self.set_status("")
         if not self.connect_to_server():
             return
@@ -583,6 +668,7 @@ class ChatClient:
         )
 
     def complete_register(self, response: dict[str, Any]) -> None:
+        """Hiển thị lỗi đăng ký hoặc chuyển sang đăng nhập sau khi tạo tài khoản."""
         if not response.get("ok"):
             self.set_status(response.get("error", "Không thể đăng ký."), error=True)
             return
@@ -596,6 +682,7 @@ class ChatClient:
         self.auth_entries["password"].focus_set()
 
     def complete_login(self, response: dict[str, Any]) -> None:
+        """Lưu tài khoản đăng nhập và tải hồ sơ, bạn bè, nhóm chat."""
         if not response.get("ok"):
             self.set_status(response.get("error", "Tên tài khoản hoặc mật khẩu không đúng."), error=True)
             return
@@ -607,9 +694,11 @@ class ChatClient:
         self.refresh_groups()
 
     def show_chat(self) -> None:
+        """Dựng màn hình chat gồm danh sách, lịch sử và khung soạn tin."""
         initial_sidebar_tab = getattr(self, "sidebar_tab", "friends")
         self.screen = "chat"
         self.conversation_options_view = None
+        self.group_members_content = None
         self.root.unbind("<Escape>")
         self.clear_root()
         self.root.title("NCHAT")
@@ -670,6 +759,17 @@ class ChatClient:
         self.groups_tab_button.pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         self.friends_view = ctk.CTkFrame(sidebar, fg_color="transparent")
+        self.friend_search_entry = ctk.CTkEntry(
+            self.friends_view,
+            height=36,
+            corner_radius=9,
+            border_color="#DFE5EF",
+            placeholder_text="Tìm bạn bè...",
+        )
+        self.friend_search_entry.pack(fill="x", padx=14, pady=(0, 8))
+        self.friend_search_entry.bind(
+            "<KeyRelease>", lambda _event: self.render_users()
+        )
         ctk.CTkButton(
             self.friends_view, text="↻  Làm mới", height=32, corner_radius=8, fg_color="#F0F4FC",
             hover_color="#E3EAF8", text_color=PRIMARY, command=self.refresh_users,
@@ -688,6 +788,17 @@ class ChatClient:
             fg_color="#F0F4FC", hover_color="#E3EAF8", text_color=PRIMARY,
             command=self.open_group_creation_page,
         ).pack(side="right")
+        self.group_search_entry = ctk.CTkEntry(
+            self.groups_view,
+            height=36,
+            corner_radius=9,
+            border_color="#DFE5EF",
+            placeholder_text="Tìm nhóm...",
+        )
+        self.group_search_entry.pack(fill="x", padx=14, pady=(0, 8))
+        self.group_search_entry.bind(
+            "<KeyRelease>", lambda _event: self.render_groups()
+        )
         self.group_list = ctk.CTkScrollableFrame(self.groups_view, fg_color="transparent")
         self.group_list.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.show_sidebar_tab(initial_sidebar_tab)
@@ -763,6 +874,7 @@ class ChatClient:
             self.set_status(self.nickname_settings_error, error=True)
 
     def show_sidebar_tab(self, tab: str) -> None:
+        """Chuyển giữa danh sách bạn bè và danh sách nhóm."""
         if tab not in {"friends", "groups"}:
             return
         self.sidebar_tab = tab
@@ -786,9 +898,11 @@ class ChatClient:
             )
 
     def load_profile(self) -> None:
+        """Yêu cầu hồ sơ riêng của tài khoản hiện đăng nhập."""
         self.send_request("profile", {}, self.complete_profile)
 
     def complete_profile(self, response: dict[str, Any]) -> None:
+        """Cập nhật tên hồ sơ trên giao diện sau phản hồi server."""
         if not response.get("ok"):
             self.set_status(response.get("error", "Không thể tải hồ sơ."), error=True)
             return
@@ -801,6 +915,7 @@ class ChatClient:
             )
 
     def show_profile(self) -> None:
+        """Dựng biểu mẫu hồ sơ và các tùy chọn quyền riêng tư."""
         self.screen = "profile"
         self.clear_root()
         page = ctk.CTkFrame(self.root, fg_color=BG)
@@ -882,10 +997,12 @@ class ChatClient:
         fields: dict[str, ctk.CTkEntry],
         visibility_vars: dict[str, BooleanVar],
     ) -> None:
+        """Gửi các trường hồ sơ và quyền xem của chúng để lưu trên server."""
         data = {key: entry.get().strip() for key, entry in fields.items()}
         data.update({key: variable.get() for key, variable in visibility_vars.items()})
 
         def saved(response: dict[str, Any]) -> None:
+            """Cập nhật trạng thái biểu mẫu theo kết quả lưu hồ sơ."""
             if not response.get("ok"):
                 self.profile_status.configure(text=response.get("error", "Không thể lưu."), text_color="#C44545")
                 return
@@ -897,25 +1014,57 @@ class ChatClient:
         self.send_request("update_profile", data, saved)
 
     def refresh_users(self) -> None:
+        """Tải lại danh sách tài khoản và trạng thái trực tuyến."""
         if self.user and self.screen == "chat" and hasattr(self, "user_list"):
             self.send_request("users", {}, self.complete_users)
 
     def refresh_groups(self) -> None:
+        """Tải lại danh sách nhóm mà tài khoản hiện tại tham gia."""
         if self.user and self.screen == "chat" and hasattr(self, "group_list"):
             self.send_request("groups", {}, self.complete_groups)
 
     def complete_groups(self, response: dict[str, Any]) -> None:
+        """Lưu danh sách nhóm từ server rồi dựng lại theo nội dung tìm kiếm."""
         if self.screen != "chat":
             return
         if not response.get("ok"):
             self.set_status(response.get("error", "Không thể tải danh sách nhóm."), error=True)
             return
         self.groups = response["data"]["groups"]
+        self.render_groups()
+
+    def render_groups(self) -> None:
+        """Lọc tức thời các nhóm và đồng bộ nhóm đang được chọn."""
+        if self.screen != "chat" or not hasattr(self, "group_list"):
+            return
         self.group_buttons.clear()
         for child in self.group_list.winfo_children():
             child.destroy()
         selected_id = self.selected_group["id"] if self.selected_group else None
-        for group in self.groups:
+        selected_group = next(
+            (group for group in self.groups if group["id"] == selected_id),
+            None,
+        )
+        if selected_group is not None:
+            self.selected_group = selected_group
+            self.chat_title.configure(
+                text=f"{selected_group['name']}  ·  {selected_group['member_count']} thành viên"
+            )
+        elif selected_id is not None:
+            self.selected_group = None
+            self.messages.clear()
+            self.displayed_message_ids.clear()
+            self.chat_title.configure(text="Chọn một người hoặc nhóm để bắt đầu trò chuyện")
+            if not self.selected_user:
+                self.chat_options_button.pack_forget()
+            self.render_messages()
+
+        filtered_groups = filter_items_by_name(
+            self.groups,
+            self.group_search_entry.get(),
+            lambda group: group["name"],
+        )
+        for group in filtered_groups:
             button = ctk.CTkButton(
                 self.group_list,
                 text=f"👥  {group['name']}  ·  {group['member_count']}",
@@ -929,28 +1078,19 @@ class ChatClient:
             )
             button.pack(fill="x", pady=2)
             self.group_buttons[group["id"]] = button
-            if group["id"] == selected_id:
-                self.selected_group = group
-                self.chat_title.configure(
-                    text=f"{group['name']}  ·  {group['member_count']} thành viên"
-                )
-        if selected_id is not None and not any(
-            group["id"] == selected_id for group in self.groups
-        ):
-            self.selected_group = None
-            self.messages.clear()
-            self.displayed_message_ids.clear()
-            self.chat_title.configure(text="Chọn một người hoặc nhóm để bắt đầu trò chuyện")
-            if not self.selected_user:
-                self.chat_options_button.pack_forget()
-            self.render_messages()
         if not self.groups:
             ctk.CTkLabel(
                 self.group_list, text="Chưa có nhóm nào.",
                 text_color=MUTED, font=("Segoe UI", 11),
             ).pack(anchor="w", padx=8, pady=5)
+        elif not filtered_groups:
+            ctk.CTkLabel(
+                self.group_list, text="Không tìm thấy nhóm phù hợp.",
+                text_color=MUTED, font=("Segoe UI", 11),
+            ).pack(anchor="w", padx=8, pady=5)
 
     def select_group(self, group: dict[str, Any]) -> None:
+        """Mở nhóm, chọn nền riêng và yêu cầu lịch sử tin nhắn."""
         if self.conversation_options_view is not None:
             self.close_conversation_options(animate=False)
         self.show_sidebar_tab("groups")
@@ -979,6 +1119,7 @@ class ChatClient:
     def complete_group_history(
         self, response: dict[str, Any], group_id: int
     ) -> None:
+        """Thêm lịch sử nhóm vào giao diện nếu nhóm đó vẫn đang được chọn."""
         if self.screen != "chat" or not response.get("ok"):
             if self.screen == "chat" and not response.get("ok"):
                 self.set_status(response.get("error", "Không thể tải lịch sử nhóm."), error=True)
@@ -990,6 +1131,7 @@ class ChatClient:
         self.scroll_to_bottom()
 
     def complete_users(self, response: dict[str, Any]) -> None:
+        """Lưu danh sách bạn bè và giữ hội thoại hiện tại nếu còn hợp lệ."""
         if self.screen != "chat":
             return
         if not response.get("ok"):
@@ -997,14 +1139,56 @@ class ChatClient:
             return
         previous = self.selected_user["id"] if self.selected_user else None
         self.users = response["data"]["users"]
+        if previous is not None:
+            selected_user = next(
+                (user for user in self.users if user["id"] == previous),
+                None,
+            )
+            if selected_user is not None:
+                self.selected_user = selected_user
+                status = (
+                    "đang hoạt động"
+                    if selected_user["online"]
+                    else "ngoại tuyến"
+                )
+                self.chat_title.configure(
+                    text=f"{self.display_name_for_user(selected_user)}  ·  {status}"
+                )
+            else:
+                self.selected_user = None
+                self.chat_title.configure(
+                    text="Chọn một người hoặc nhóm để bắt đầu trò chuyện"
+                )
+                self.chat_options_button.pack_forget()
+                self.close_conversation_options(animate=False)
+                self.current_wallpaper = None
+                self.messages.clear()
+                self.displayed_message_ids.clear()
+                self.render_messages()
+        self.render_users()
+
+    def render_users(self) -> None:
+        """Lọc tức thời danh sách bạn bè theo tên đang nhập."""
+        if self.screen != "chat" or not hasattr(self, "user_list"):
+            return
         self.nickname_labels.clear()
         for child in self.user_list.winfo_children():
             child.destroy()
-        for user in self.users:
+        filtered_users = filter_items_by_name(
+            self.users,
+            self.friend_search_entry.get(),
+            self.display_name_for_user,
+        )
+        for user in filtered_users:
             online = bool(user["online"])
             row = ctk.CTkFrame(
                 self.user_list,
-                fg_color="#EEF3FF" if user["id"] == previous else "transparent",
+                fg_color=(
+                    "#EEF3FF"
+                    if self.selected_user
+                    and user["id"] == self.selected_user["id"]
+                    else "transparent"
+                ),
                 corner_radius=10,
             )
             row.pack(fill="x", pady=3)
@@ -1041,30 +1225,19 @@ class ChatClient:
             profile_button.pack(side="right", padx=8)
             for widget in (row, details, name, state):
                 widget.bind("<Button-1>", lambda _event, target=user: self.select_user(target))
-            if user["id"] == previous:
-                self.selected_user = user
-                status = "đang hoạt động" if online else "ngoại tuyến"
-                self.chat_title.configure(
-                    text=f"{self.display_name_for_user(user)}  ·  {status}"
-                )
-        if previous is not None and not any(user["id"] == previous for user in self.users):
-            self.selected_user = None
-            self.chat_title.configure(
-                text="Chọn một người hoặc nhóm để bắt đầu trò chuyện"
-            )
-            self.chat_options_button.pack_forget()
-            self.close_conversation_options(animate=False)
-            self.current_wallpaper = None
-            self.messages.clear()
-            self.displayed_message_ids.clear()
-            self.render_messages()
         if not self.users:
             ctk.CTkLabel(
                 self.user_list, text="Chưa có tài khoản nào khác.",
                 text_color=MUTED, font=("Segoe UI", 12),
             ).pack(pady=18)
+        elif not filtered_users:
+            ctk.CTkLabel(
+                self.user_list, text="Không tìm thấy bạn bè phù hợp.",
+                text_color=MUTED, font=("Segoe UI", 11),
+            ).pack(pady=12)
 
     def select_user(self, user: dict[str, Any]) -> None:
+        """Mở cuộc trò chuyện cá nhân và tải lịch sử từ server."""
         if self.conversation_options_view is not None:
             self.close_conversation_options(animate=False)
         self.show_sidebar_tab("friends")
@@ -1091,11 +1264,13 @@ class ChatClient:
         self.refresh_users()
 
     def display_name_for_user(self, user: dict[str, Any]) -> str:
+        """Lấy tên người dùng theo biệt danh cục bộ nếu đã đặt."""
         if self.user is None:
             return str(user.get("display_name") or "Người dùng")
         return conversation_display_name(user, self.user["id"], self.nicknames)
 
     def view_user_profile(self, user: dict[str, Any]) -> None:
+        """Yêu cầu thông tin công khai của người dùng được chọn."""
         self.screen = "public_profile"
         self.send_request(
             "public_profile",
@@ -1108,6 +1283,7 @@ class ChatClient:
         response: dict[str, Any],
         selected_user: dict[str, Any],
     ) -> None:
+        """Hiển thị các trường hồ sơ mà chủ tài khoản đã công khai."""
         if not response.get("ok"):
             if self.screen != "public_profile":
                 return
@@ -1180,6 +1356,7 @@ class ChatClient:
         label: str,
         value: str,
     ) -> None:
+        """Thêm một cặp nhãn/giá trị hồ sơ chỉ đọc vào trang."""
         ctk.CTkLabel(
             parent, text=label, text_color=MUTED, font=("Segoe UI", 11)
         ).pack(anchor="w", pady=(10, 2))
@@ -1188,6 +1365,7 @@ class ChatClient:
         ).pack(anchor="w")
 
     def return_to_chat(self) -> None:
+        """Dựng lại màn hình chat rồi tải lại danh sách và lịch sử đang mở."""
         self.show_chat()
         self.refresh_users()
         self.refresh_groups()
@@ -1207,6 +1385,7 @@ class ChatClient:
             )
 
     def complete_history(self, response: dict[str, Any], conversation_id: int) -> None:
+        """Hiển thị lịch sử cá nhân nếu đúng cuộc trò chuyện đang được chọn."""
         if self.screen != "chat":
             return
         if not response.get("ok"):
@@ -1219,6 +1398,7 @@ class ChatClient:
         self.scroll_to_bottom()
 
     def add_message(self, message: dict[str, Any]) -> None:
+        """Thêm tin nhắn mới một lần duy nhất vào dữ liệu và khung chat."""
         if self.screen != "chat" or not hasattr(self, "messages_canvas"):
             return
         message_id = message.get("id")
@@ -1232,10 +1412,12 @@ class ChatClient:
         self.scroll_to_bottom()
 
     def scroll_to_bottom(self) -> None:
+        """Cuộn lịch sử xuống tin nhắn mới nhất sau khi bố cục hoàn tất."""
         if hasattr(self, "messages_canvas"):
             self.root.after(80, lambda: self.messages_canvas.yview_moveto(1.0))
 
     def selected_wallpaper_for_current_conversation(self) -> str | None:
+        """Tìm ảnh nền lưu riêng cho cuộc trò chuyện cá nhân hoặc nhóm."""
         if not self.user:
             return None
         if self.selected_group:
@@ -1251,6 +1433,7 @@ class ChatClient:
         return filename
 
     def get_wallpaper_image(self, filename: str) -> Image.Image:
+        """Đọc và cache ảnh nền để tránh mở lại tệp nhiều lần."""
         if filename not in self.wallpaper_images:
             path = next((item for item in self.wallpaper_files if item.name == filename), None)
             if path is None:
@@ -1260,6 +1443,7 @@ class ChatClient:
         return self.wallpaper_images[filename]
 
     def render_messages(self, preserve_scroll: bool = False) -> None:
+        """Vẽ lại nền và toàn bộ tin nhắn, có thể giữ vị trí cuộn."""
         if not hasattr(self, "messages_canvas") or not self.messages_canvas.winfo_exists():
             return
         canvas = self.messages_canvas
@@ -1290,6 +1474,7 @@ class ChatClient:
         canvas.yview_moveto(old_position)
 
     def draw_message(self, message: dict[str, Any]) -> None:
+        """Vẽ tin hệ thống hoặc bong bóng tin nhắn, tệp và thời gian."""
         canvas = self.messages_canvas
         width = canvas.winfo_width()
         if width <= 1:
@@ -1387,6 +1572,7 @@ class ChatClient:
         self.message_content_bottom = bubble_bottom + 10
 
     def update_message_scrollregion(self) -> None:
+        """Cập nhật vùng cuộn theo chiều cao nội dung tin nhắn hiện tại."""
         if not hasattr(self, "messages_canvas") or not self.messages_canvas.winfo_exists():
             return
         canvas = self.messages_canvas
@@ -1399,6 +1585,7 @@ class ChatClient:
             canvas.tag_lower(self.wallpaper_canvas_item)
 
     def update_message_scrollbar(self, first: str, last: str) -> None:
+        """Đồng bộ thanh cuộn và vị trí ảnh nền trong canvas."""
         if hasattr(self, "messages_scrollbar") and self.messages_scrollbar.winfo_exists():
             self.messages_scrollbar.set(first, last)
         if (
@@ -1411,13 +1598,16 @@ class ChatClient:
             )
 
     def on_messages_canvas_configure(self, _event: Any) -> None:
+        """Vẽ lại tin nhắn khi kích thước vùng hội thoại thay đổi."""
         self.render_messages(preserve_scroll=True)
 
     def on_messages_mousewheel(self, event: Any) -> str:
+        """Cuộn lịch sử bằng bánh xe chuột và chặn hành vi mặc định."""
         self.messages_canvas.yview_scroll(-int(event.delta / 120), "units")
         return "break"
 
     def on_message_canvas_click(self, _event: Any) -> None:
+        """Bắt thao tác bấm tệp đính kèm để yêu cầu tải tệp."""
         current_items = self.messages_canvas.find_withtag("current")
         if not current_items:
             return
@@ -1430,6 +1620,7 @@ class ChatClient:
                 return
 
     def on_message_canvas_motion(self, _event: Any) -> None:
+        """Đổi con trỏ khi rê chuột lên liên kết tải tệp."""
         current_items = self.messages_canvas.find_withtag("current")
         tags = self.messages_canvas.gettags(current_items[0]) if current_items else ()
         self.messages_canvas.configure(
@@ -1437,6 +1628,7 @@ class ChatClient:
         )
 
     def open_conversation_menu(self) -> None:
+        """Mở trang tùy chọn của cuộc trò chuyện hiện tại."""
         if not self.selected_user and not self.selected_group:
             self.set_status("Hãy chọn một cuộc trò chuyện trước.")
             return
@@ -1455,6 +1647,8 @@ class ChatClient:
         self.animate_conversation_options(0, 1)
 
     def build_conversation_options_page(self, page: ctk.CTkFrame) -> None:
+        """Dựng danh sách chức năng phù hợp với chat cá nhân hoặc nhóm."""
+        self.group_members_content = None
         self.clear_conversation_options_page(page)
         header = ctk.CTkFrame(page, fg_color="transparent", height=66)
         header.pack(fill="x", padx=18)
@@ -1492,6 +1686,7 @@ class ChatClient:
             ).pack(fill="x")
         elif self.selected_group:
             for label, feature in (
+                ("Xem thành viên", "members"),
                 ("Đổi ảnh nền chat", "wallpaper"),
                 ("Đổi tên nhóm", "rename_group"),
                 ("Thêm người mới vào nhóm", "add_members"),
@@ -1500,7 +1695,9 @@ class ChatClient:
                     content, text=label, height=52, corner_radius=10,
                     fg_color="#F0F4FC", hover_color="#E3EAF8", text_color=INK,
                     font=("Segoe UI", 14, "bold"), anchor="w",
-                    command=lambda selected=feature: self.show_conversation_feature(selected),
+                    command=lambda selected=feature: self.show_conversation_feature(
+                        selected
+                    ),
                 ).pack(fill="x", pady=(0, 10))
             ctk.CTkButton(
                 content, text="Rời nhóm", height=52, corner_radius=10,
@@ -1511,19 +1708,23 @@ class ChatClient:
 
     @staticmethod
     def clear_conversation_options_page(page: ctk.CTkFrame) -> None:
+        """Xóa widget cũ trước khi dựng trang tùy chọn kế tiếp."""
         for child in page.winfo_children():
             child.destroy()
 
     def show_conversation_feature(self, feature: str) -> None:
+        """Mở trang chi tiết cho một chức năng trong menu ba chấm."""
         page = self.conversation_options_view
         if page is None or not page.winfo_exists():
             return
         if feature not in {
-            "wallpaper", "nickname", "create_group", "rename_group", "add_members"
+            "wallpaper", "nickname", "create_group", "rename_group", "add_members",
+            "members",
         }:
             return
-        if feature in {"rename_group", "add_members"} and not self.selected_group:
+        if feature in {"rename_group", "add_members", "members"} and not self.selected_group:
             return
+        self.group_members_content = None
         self.clear_conversation_options_page(page)
         header = ctk.CTkFrame(page, fg_color="transparent", height=66)
         header.pack(fill="x", padx=18)
@@ -1540,6 +1741,7 @@ class ChatClient:
             "create_group": "Tạo nhóm",
             "rename_group": "Đổi tên nhóm",
             "add_members": "Thêm thành viên",
+            "members": "Thành viên nhóm",
         }[feature]
         ctk.CTkLabel(
             header, text=title, text_color=INK, font=("Segoe UI", 17, "bold"),
@@ -1554,10 +1756,13 @@ class ChatClient:
             self.build_group_rename_feature(content)
         elif feature == "add_members":
             self.load_group_add_member_feature(content)
+        elif feature == "members":
+            self.load_group_members_feature(content)
         else:
             self.build_group_creation_page(content)
 
     def open_group_creation_page(self) -> None:
+        """Mở biểu mẫu tạo nhóm từ nút cộng trong danh sách nhóm."""
         if self.conversation_options_view is None:
             self.conversation_options_view = ctk.CTkFrame(
                 self.chat_frame, fg_color=CARD, corner_radius=16,
@@ -1572,6 +1777,7 @@ class ChatClient:
         self.show_conversation_feature("create_group")
 
     def build_group_creation_page(self, content: ctk.CTkFrame) -> None:
+        """Dựng biểu mẫu nhập tên nhóm và chọn thành viên ban đầu."""
         ctk.CTkLabel(
             content, text="Đặt tên nhóm", text_color=INK,
             font=("Segoe UI", 13, "bold"),
@@ -1616,6 +1822,7 @@ class ChatClient:
         ).pack(anchor="e")
 
     def submit_group_creation(self) -> None:
+        """Kiểm tra lựa chọn rồi gửi yêu cầu tạo nhóm tới server."""
         group_name = self.group_name_entry.get().strip()
         member_ids = [
             user_id for user_id, selected in self.group_member_vars.items()
@@ -1629,6 +1836,7 @@ class ChatClient:
             return
 
         def created(response: dict[str, Any]) -> None:
+            """Mở nhóm vừa tạo và cập nhật các danh sách liên quan."""
             if not response.get("ok"):
                 self.set_status(response.get("error", "Không thể tạo nhóm."), error=True)
                 return
@@ -1647,6 +1855,7 @@ class ChatClient:
         )
 
     def apply_group_update(self, data: dict[str, Any]) -> None:
+        """Áp dụng tên/số thành viên mới và tin hoạt động vào nhóm đang mở."""
         group = data.get("group")
         if not isinstance(group, dict):
             return
@@ -1662,6 +1871,7 @@ class ChatClient:
             self.add_message(message)
 
     def build_group_rename_feature(self, content: ctk.CTkFrame) -> None:
+        """Dựng ô nhập tên mới cho nhóm đang trò chuyện."""
         if not self.selected_group:
             return
         ctk.CTkLabel(
@@ -1681,6 +1891,7 @@ class ChatClient:
         ).pack(anchor="e")
 
     def submit_group_rename(self) -> None:
+        """Gửi tên nhóm mới và cập nhật giao diện theo kết quả server."""
         if not self.selected_group:
             return
         name = self.group_rename_entry.get().strip()
@@ -1690,6 +1901,7 @@ class ChatClient:
         group_id = self.selected_group["id"]
 
         def renamed(response: dict[str, Any]) -> None:
+            """Đóng trang đổi tên khi server cập nhật thành công."""
             if not response.get("ok"):
                 self.set_status(response.get("error", "Không thể đổi tên nhóm."), error=True)
                 return
@@ -1702,6 +1914,7 @@ class ChatClient:
         )
 
     def load_group_add_member_feature(self, content: ctk.CTkFrame) -> None:
+        """Tải thành viên hiện tại rồi chỉ cho chọn người chưa tham gia."""
         if not self.selected_group:
             return
         group_id = self.selected_group["id"]
@@ -1711,6 +1924,7 @@ class ChatClient:
         ).pack(anchor="w")
 
         def loaded(response: dict[str, Any]) -> None:
+            """Hiển thị danh sách có thể thêm sau khi tải thành viên xong."""
             if not content.winfo_exists():
                 return
             for child in content.winfo_children():
@@ -1760,7 +1974,182 @@ class ChatClient:
 
         self.send_request("group_members", {"group_id": group_id}, loaded)
 
+    def load_group_members_feature(self, content: ctk.CTkFrame) -> None:
+        """Tải danh sách thành viên và trạng thái trưởng nhóm của nhóm hiện tại."""
+        if not self.selected_group:
+            return
+        self.group_members_content = content
+        for child in content.winfo_children():
+            child.destroy()
+        group_id = self.selected_group["id"]
+        ctk.CTkLabel(
+            content, text="Đang tải thành viên nhóm…", text_color=MUTED,
+            font=("Segoe UI", 12),
+        ).pack(anchor="w")
+
+        def loaded(response: dict[str, Any]) -> None:
+            """Hiển thị vai trò và quyền quản lý khi dữ liệu thành viên đã tải."""
+            if (
+                self.group_members_content is not content
+                or not content.winfo_exists()
+                or not self.selected_group
+                or self.selected_group["id"] != group_id
+            ):
+                return
+            for child in content.winfo_children():
+                child.destroy()
+            if not response.get("ok"):
+                ctk.CTkLabel(
+                    content, text=response.get("error", "Không tải được thành viên."),
+                    text_color="#C44545", font=("Segoe UI", 12),
+                ).pack(anchor="w")
+                return
+            data = response["data"]
+            members = data.get("members", [])
+            leader_id = data.get("leader_id")
+            creator_id = data.get("creator_id")
+            current_user_id = (self.user or {}).get("id")
+            is_leader = current_user_id == leader_id
+            member_list = ctk.CTkScrollableFrame(
+                content, fg_color="#F6F8FC", height=330
+            )
+            member_list.pack(fill="both", expand=True)
+            for member in members:
+                row = ctk.CTkFrame(
+                    member_list, fg_color=CARD, corner_radius=9
+                )
+                row.pack(fill="x", padx=4, pady=4)
+                name_area = ctk.CTkFrame(row, fg_color="transparent")
+                name_area.pack(fill="x", padx=10, pady=(8, 0))
+                ctk.CTkLabel(
+                    name_area,
+                    text=member["display_name"],
+                    text_color=INK,
+                    font=("Segoe UI", 12, "bold"),
+                    anchor="w",
+                ).pack(anchor="w")
+                ctk.CTkLabel(
+                    name_area,
+                    text=group_member_role_text(
+                        member["id"], leader_id, creator_id
+                    ),
+                    text_color=(
+                        PRIMARY if member["id"] == leader_id else MUTED
+                    ),
+                    font=("Segoe UI", 10),
+                    anchor="w",
+                ).pack(anchor="w")
+                if is_leader and member["id"] != current_user_id:
+                    actions = ctk.CTkFrame(row, fg_color="transparent")
+                    actions.pack(fill="x", padx=10, pady=(4, 8))
+                    ctk.CTkButton(
+                        actions,
+                        text="Chuyển trưởng nhóm",
+                        width=126,
+                        height=30,
+                        corner_radius=7,
+                        fg_color="#EEF3FF",
+                        hover_color="#DFE8FC",
+                        text_color=PRIMARY,
+                        font=("Segoe UI", 10, "bold"),
+                        command=lambda selected=member: self.confirm_transfer_group_leadership(
+                            selected["id"], selected["display_name"], content
+                        ),
+                    ).pack(side="left")
+                    ctk.CTkButton(
+                        actions,
+                        text="Kick khỏi nhóm",
+                        width=100,
+                        height=30,
+                        corner_radius=7,
+                        fg_color="#FDECEC",
+                        hover_color="#F9DADA",
+                        text_color="#B44646",
+                        font=("Segoe UI", 10, "bold"),
+                        command=lambda selected=member: self.confirm_remove_group_member(
+                            selected["id"], selected["display_name"], content
+                        ),
+                    ).pack(side="left", padx=(6, 0))
+            if not members:
+                ctk.CTkLabel(
+                    content, text="Nhóm hiện không có thành viên.",
+                    text_color=MUTED, font=("Segoe UI", 11),
+                ).pack(anchor="w", pady=8)
+
+        self.send_request("group_members", {"group_id": group_id}, loaded)
+
+    def confirm_remove_group_member(
+        self, member_id: int, display_name: str, content: ctk.CTkFrame
+    ) -> None:
+        """Xác nhận rồi gửi yêu cầu trưởng nhóm xóa thành viên."""
+        if not self.selected_group:
+            return
+        if not messagebox.askyesno(
+            "Xóa thành viên",
+            f"Bạn có chắc muốn xóa {display_name} khỏi nhóm?",
+        ):
+            return
+        group_id = self.selected_group["id"]
+        self.send_group_member_action(
+            "remove_group_member",
+            {"group_id": group_id, "member_id": member_id},
+            content,
+            "Đã xóa thành viên khỏi nhóm.",
+        )
+
+    def confirm_transfer_group_leadership(
+        self, member_id: int, display_name: str, content: ctk.CTkFrame
+    ) -> None:
+        """Xác nhận rồi chuyển quyền trưởng nhóm cho thành viên đã chọn."""
+        if not self.selected_group:
+            return
+        if not messagebox.askyesno(
+            "Chuyển trưởng nhóm",
+            f"Chuyển quyền trưởng nhóm cho {display_name}?",
+        ):
+            return
+        group_id = self.selected_group["id"]
+        self.send_group_member_action(
+            "transfer_group_leadership",
+            {"group_id": group_id, "member_id": member_id},
+            content,
+            f"Đã chuyển quyền trưởng nhóm cho {display_name}.",
+        )
+
+    def send_group_member_action(
+        self,
+        action: str,
+        data: dict[str, Any],
+        content: ctk.CTkFrame,
+        success_message: str,
+    ) -> None:
+        """Cập nhật nhóm sau thao tác quản lý thành viên thành công."""
+        def updated(response: dict[str, Any]) -> None:
+            if not response.get("ok"):
+                self.set_status(
+                    response.get("error", "Không thể cập nhật thành viên nhóm."),
+                    error=True,
+                )
+                return
+            result = response["data"]
+            self.apply_group_update(result)
+            self.set_status(success_message)
+            if (
+                self.user
+                and result.get("removed_user_id") == self.user["id"]
+            ):
+                self.close_conversation_options(animate=False)
+                return
+            if (
+                self.group_members_content is content
+                and content.winfo_exists()
+            ):
+                self.load_group_members_feature(content)
+
+        self.send_request(action, data, updated)
+
     def submit_group_add_members(self) -> None:
+        """Gửi những người được chọn để thêm vào nhóm hiện tại."""
         if not self.selected_group:
             return
         member_ids = [
@@ -1774,6 +2163,7 @@ class ChatClient:
         group_id = self.selected_group["id"]
 
         def added(response: dict[str, Any]) -> None:
+            """Cập nhật danh sách nhóm và đóng trang khi thêm thành công."""
             if not response.get("ok"):
                 self.set_status(response.get("error", "Không thể thêm thành viên."), error=True)
                 return
@@ -1788,6 +2178,7 @@ class ChatClient:
         )
 
     def confirm_leave_group(self) -> None:
+        """Yêu cầu xác nhận trước khi rời nhóm."""
         if not self.selected_group:
             return
         group_name = self.selected_group["name"]
@@ -1797,11 +2188,13 @@ class ChatClient:
             self.leave_selected_group()
 
     def leave_selected_group(self) -> None:
+        """Rời nhóm trên server rồi xóa hội thoại khỏi màn hình hiện tại."""
         if not self.selected_group:
             return
         group_id = self.selected_group["id"]
 
         def left(response: dict[str, Any]) -> None:
+            """Dọn trạng thái hội thoại sau khi server xác nhận đã rời."""
             if not response.get("ok"):
                 self.set_status(response.get("error", "Không thể rời nhóm."), error=True)
                 return
@@ -1822,6 +2215,7 @@ class ChatClient:
         self.send_request("leave_group", {"group_id": group_id}, left)
 
     def build_wallpaper_feature(self, content: ctk.CTkFrame) -> None:
+        """Dựng lựa chọn ảnh nền có sẵn và nút khôi phục mặc định."""
         ctk.CTkLabel(
             content, text="Chọn hình nền cho cuộc trò chuyện này.",
             text_color=MUTED, font=("Segoe UI", 11),
@@ -1868,6 +2262,7 @@ class ChatClient:
         ).pack(anchor="w", pady=(16, 0))
 
     def build_nickname_feature(self, content: ctk.CTkFrame) -> None:
+        """Dựng biểu mẫu đặt hoặc xóa biệt danh cục bộ cho bạn bè."""
         if not self.selected_user or not self.user:
             return
         key = conversation_key(self.user["id"], self.selected_user["id"])
@@ -1896,6 +2291,7 @@ class ChatClient:
         ).pack(anchor="w", pady=(10, 0))
 
     def save_conversation_nickname(self, nickname: str) -> None:
+        """Lưu biệt danh cục bộ và cập nhật tên trong danh sách/chat."""
         if not self.user or not self.selected_user:
             self.set_status("Hãy chọn một cuộc trò chuyện trước.")
             return
@@ -1934,6 +2330,7 @@ class ChatClient:
         )
 
     def animate_conversation_options(self, step: int, direction: int) -> None:
+        """Trượt trang tùy chọn vào/ra trong khung chat."""
         page = self.conversation_options_view
         if page is None or not page.winfo_exists():
             return
@@ -1953,8 +2350,10 @@ class ChatClient:
         )
 
     def close_conversation_options(self, animate: bool = True) -> None:
+        """Đóng trang tùy chọn có hoặc không dùng hiệu ứng trượt."""
         if self.conversation_options_view is None:
             return
+        self.group_members_content = None
         if animate:
             self.animate_conversation_options(0, -1)
         else:
@@ -1962,6 +2361,7 @@ class ChatClient:
             self.conversation_options_view = None
 
     def set_conversation_wallpaper(self, filename: str | None) -> None:
+        """Lưu ảnh nền cho hội thoại hiện tại và vẽ lại khung tin nhắn."""
         if not self.user or (not self.selected_user and not self.selected_group):
             self.set_status("Hãy chọn một cuộc trò chuyện trước.")
             return
@@ -1999,6 +2399,7 @@ class ChatClient:
         )
 
     def send_text(self) -> None:
+        """Gửi nội dung ô soạn tới chat cá nhân hoặc nhóm đang mở."""
         if not self.selected_user and not self.selected_group:
             self.set_status("Hãy chọn một tài khoản hoặc nhóm trước.")
             return
@@ -2014,6 +2415,7 @@ class ChatClient:
         request_data["body"] = body
 
         def sent(response: dict[str, Any]) -> None:
+            """Xóa ô nhập và thêm tin vào khung chat sau phản hồi thành công."""
             if not response.get("ok"):
                 self.set_status(response.get("error", "Không thể gửi tin nhắn."), error=True)
                 return
@@ -2021,6 +2423,7 @@ class ChatClient:
             self.message_entry.delete(0, "end")
             self.set_status("Đã gửi tin nhắn.")
 
+        # Chọn action theo loại hội thoại; server chịu trách nhiệm lưu và chuyển tiếp.
         self.send_request(
             "send_group_message" if is_group else "send_message",
             request_data,
@@ -2028,6 +2431,7 @@ class ChatClient:
         )
 
     def choose_attachment(self) -> None:
+        """Chọn tệp, mã hóa nội dung và gửi tới hội thoại hiện tại."""
         if not self.selected_user and not self.selected_group:
             self.set_status("Hãy chọn một tài khoản hoặc nhóm trước.")
             return
@@ -2072,6 +2476,7 @@ class ChatClient:
         )
 
         def sent(response: dict[str, Any]) -> None:
+            """Thêm tệp vào lịch sử sau khi server xác nhận đã nhận."""
             if not response.get("ok"):
                 self.set_status(response.get("error", "Không thể gửi tệp."), error=True)
                 return
@@ -2087,6 +2492,7 @@ class ChatClient:
     def download_attachment(
         self, message_id: int, group_id: int | None = None
     ) -> None:
+        """Yêu cầu server tải tệp, kèm mã nhóm nếu là tin nhắn nhóm."""
         data: dict[str, Any] = {"message_id": message_id}
         if group_id is not None:
             data["group_id"] = group_id
@@ -2095,6 +2501,7 @@ class ChatClient:
         )
 
     def save_download(self, response: dict[str, Any]) -> None:
+        """Mở hộp thoại lưu và ghi nội dung tệp nhận được ra máy."""
         if not response.get("ok"):
             self.set_status(response.get("error", "Không thể tải tệp."), error=True)
             return
@@ -2112,6 +2519,7 @@ class ChatClient:
         self.set_status(f"Đã lưu tệp: {destination}")
 
     def logout(self) -> None:
+        """Xóa trạng thái tài khoản, đóng socket và trở về đăng nhập."""
         self.user = None
         self.profile = None
         self.selected_user = None
@@ -2134,6 +2542,7 @@ class ChatClient:
         self.connect_to_server()
 
     def close(self) -> None:
+        """Đóng kết nối mạng và cửa sổ ứng dụng."""
         if not self.closed:
             self.closed = True
             if self.sock is not None:
@@ -2146,6 +2555,7 @@ class ChatClient:
 
 
 def main() -> None:
+    """Khởi chạy giao diện NCHAT và vòng lặp sự kiện Tkinter."""
     ctk.set_appearance_mode("light")
     ctk.set_default_color_theme("blue")
     root = ctk.CTk()

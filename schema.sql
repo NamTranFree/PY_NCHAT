@@ -38,8 +38,10 @@ CREATE TABLE IF NOT EXISTS chat_groups (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(80) NOT NULL,
     created_by BIGINT UNSIGNED NOT NULL,
+    leader_id BIGINT UNSIGNED NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_chat_groups_creator FOREIGN KEY (created_by) REFERENCES users(id)
+    CONSTRAINT fk_chat_groups_creator FOREIGN KEY (created_by) REFERENCES users(id),
+    CONSTRAINT fk_chat_groups_leader FOREIGN KEY (leader_id) REFERENCES users(id)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS group_members (
